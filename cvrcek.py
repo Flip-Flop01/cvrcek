@@ -393,7 +393,28 @@ def parse_args():
   parser.add_argument(
       "--mercy", action="store_true", help="Allow Ctrl+C during normal runs"
   )
+  parser.add_argument(
+      "-f",
+      "--forever",
+      action="store_true",
+      help="Endless conga line of roaches (Ctrl+C to stop)",
+  )
   return parser.parse_args()
+
+
+def _rotation_matrix(angle_y, angle_z, angle_x):
+  """Rows of Rx(angle_x) @ Rz(angle_z) @ Ry(angle_y) (same order as _rot_*)."""
+  cy, sy = math.cos(angle_y), math.sin(angle_y)
+  cz, sz = math.cos(angle_z), math.sin(angle_z)
+  cx, sx = math.cos(angle_x), math.sin(angle_x)
+  # Rz @ Ry
+  a = ((cz * cy, -sz, cz * sy), (sz * cy, cz, sz * sy), (-sy, 0.0, cy))
+  # Rx @ (Rz @ Ry)
+  return (
+      a[0],
+      tuple(cx * a[1][i] - sx * a[2][i] for i in range(3)),
+      tuple(sx * a[1][i] + cx * a[2][i] for i in range(3)),
+  )
 
 
 def render_sprite(
@@ -412,67 +433,97 @@ def render_sprite(
     rim=False,
     depth_fog=False,
 ):
-  zbuffer = [-999.0] * (box_w * box_h)
-  depth_map = [0.5] * (box_w * box_h)
-  output = [" "] * (box_w * box_h)
+  """Renders one roach into box_h rows of box_w characters.
+
+  Two passes for speed: first every point is only projected and z-tested
+  (keeping the index of the nearest point per cell), then lighting runs once
+  per visible cell instead of once per point. Normals are never rotated:
+  the light and half vectors are rotated into mesh space instead
+  (dot(R n, l) == dot(n, R^T l)).
+  """
+  size = box_w * box_h
+  zbuffer = [-999.0] * size
+  winner = [-1] * size
 
   scale_y = box_h * 0.185
-  scale_x = scale_y * 2.0
+  sx5 = scale_y * 2.0 * 5.0
+  sy5 = scale_y * 5.0
+  half_w = box_w / 2
+  half_h = box_h / 2
+
+  (r00, r01, r02), (r10, r11, r12), (r20, r21, r22) = _rotation_matrix(
+      angle_y, angle_z, angle_x
+  )
+  # bob_y is added to y before rotating: fold it into a constant offset.
+  ox, oy, oz = r01 * bob_y, r11 * bob_y, r21 * bob_y
+
+  for i, (x, y, z, _nx, _ny, _nz, _b) in enumerate(mesh):
+    denom = r20 * x + r21 * y + r22 * z + oz + 5.8
+    if denom <= 0.4:
+      continue
+    inv_z = 1.0 / denom
+    px = int(half_w + (r00 * x + r01 * y + r02 * z + ox) * sx5 * inv_z)
+    if px < 0 or px >= box_w:
+      continue
+    py = int(half_h - (r10 * x + r11 * y + r12 * z + oy) * sy5 * inv_z)
+    if py < 0 or py >= box_h:
+      continue
+    idx = py * box_w + px
+    if inv_z > zbuffer[idx]:
+      zbuffer[idx] = inv_z
+      winner[idx] = i
 
   vx, vy, vz = 0.0, 0.0, 1.0
   hx_dir, hy_dir, hz_dir = lx + vx, ly + vy, lz + vz
   h_len = math.sqrt(hx_dir**2 + hy_dir**2 + hz_dir**2) or 1.0
   hx_dir, hy_dir, hz_dir = hx_dir / h_len, hy_dir / h_len, hz_dir / h_len
 
+  # Light / half vector in mesh space (R^T v).
+  mlx = r00 * lx + r10 * ly + r20 * lz
+  mly = r01 * lx + r11 * ly + r21 * lz
+  mlz = r02 * lx + r12 * ly + r22 * lz
+  mhx = r00 * hx_dir + r10 * hy_dir + r20 * hz_dir
+  mhy = r01 * hx_dir + r11 * hy_dir + r21 * hz_dir
+  mhz = r02 * hx_dir + r12 * hy_dir + r22 * hz_dir
+
   dw = max(0.0, min(1.0, depth_weight))
   lw = 1.0 - dw
+  ramp = SPECULAR_CHARS if specular else CHARS
+  ramp_top = len(ramp) - 1
+  ramp_scale = ramp_top + 0.999
 
-  for x, y, z, nx, ny, nz, bias in mesh:
-    p = _rot_y((x, y + bob_y, z), angle_y)
-    p = _rot_z(p, angle_z)
-    x3, y3, z3 = _rot_x(p, angle_x)
+  output = [" "] * size
+  depth_map = [0.5] * size
 
-    n = _rot_y((nx, ny, nz), angle_y)
-    n = _rot_z(n, angle_z)
-    nx3, ny3, nz3 = _rot_x(n, angle_x)
-
-    denom = z3 + 5.8
-    if denom <= 0.4:
+  for idx in range(size):
+    i = winner[idx]
+    if i < 0:
       continue
-    inv_z = 1.0 / denom
-    px = int(box_w / 2 + x3 * scale_x * inv_z * 5.0)
-    py = int(box_h / 2 - y3 * scale_y * inv_z * 5.0)
+    x, y, z, nx, ny, nz, bias = mesh[i]
+    z3 = 1.0 / zbuffer[idx] - 5.8
 
-    if 0 <= px < box_w and 0 <= py < box_h:
-      idx = py * box_w + px
-      if inv_z > zbuffer[idx]:
-        zbuffer[idx] = inv_z
+    near_factor = (1.6 - z3) / 3.2
+    near_factor = 0.0 if near_factor < 0.0 else 1.0 if near_factor > 1.0 else near_factor
 
-        near_factor = max(0.0, min(1.0, (1.6 - z3) / 3.2))
+    if depth_fog:
+      depth_map[idx] = max(0.45, min(1.25, 0.55 + near_factor * 0.65))
 
-        if depth_fog:
-          depth_map[idx] = max(0.45, min(1.25, 0.55 + near_factor * 0.65))
+    raw_lum = nx * mlx + ny * mly + nz * mlz + bias
+    lit_factor = max(0.0, min(1.0, (raw_lum + 0.65) / 1.65))
 
-        raw_lum = nx3 * lx + ny3 * ly + nz3 * lz + bias
-        lit_factor = max(0.0, min(1.0, (raw_lum + 0.65) / 1.65))
+    combined = dw * near_factor + lw * lit_factor
+    if specular:
+      ndoth = nx * mhx + ny * mhy + nz * mhz
+      if ndoth > 0.0:
+        combined += (ndoth**14) * 0.35
+    if rim:
+      grazing = 1.0 - abs(r20 * nx + r21 * ny + r22 * nz)
+      if grazing > 0.0:
+        combined += (grazing**2.2) * 0.20
 
-        spec = 0.0
-        if specular:
-          ndoth = max(0.0, nx3 * hx_dir + ny3 * hy_dir + nz3 * hz_dir)
-          spec = (ndoth**14) * 0.35
-
-        rim_boost = 0.0
-        if rim:
-          grazing = max(0.0, 1.0 - abs(nz3))
-          rim_boost = (grazing**2.2) * 0.20
-
-        combined = max(
-            0.0, min(1.0, dw * near_factor + lw * lit_factor + spec + rim_boost)
-        )
-        ramp = SPECULAR_CHARS if specular else CHARS
-        char_idx = int(combined * (len(ramp) - 1 + 0.999))
-        char_idx = max(0, min(len(ramp) - 1, char_idx))
-        output[idx] = ramp[char_idx]
+    combined = 0.0 if combined < 0.0 else 1.0 if combined > 1.0 else combined
+    char_idx = int(combined * ramp_scale)
+    output[idx] = ramp[char_idx if char_idx < ramp_top else ramp_top]
 
   rows_out = [
       "".join(output[r * box_w : (r + 1) * box_w]) for r in range(box_h)
@@ -484,10 +535,20 @@ def render_sprite(
   return rows_out, avg_depths
 
 
+def visible_roaches(pos, spacing, box_w, cols, count=None):
+  """Indices s of the roaches on screen (roach_x = pos + s * spacing must be
+  in (-box_w, cols)). count=None means an endless line (--forever)."""
+  first = max(0, (-box_w - pos) // spacing + 1)
+  last = (cols - 1 - pos) // spacing
+  if count is not None:
+    last = min(count - 1, last)
+  return range(first, last + 1)
+
+
 def run():
   args = parse_args()
 
-  if not args.mercy and not args.loop:
+  if not (args.mercy or args.loop or args.forever):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
   sys.stdout.write("\033[?25l\033[2J")
@@ -516,13 +577,21 @@ def run():
 
     if args.loop:
       positions = [(cols - box_w) // 2]
+    elif args.forever:
+      positions = None  # pos is computed per frame, never ends
     else:
       total_span = spacing * (swarm_count - 1)
       positions = list(range(cols, -box_w - total_span, -1))
 
     pos_idx = 0
+    next_frame = time.monotonic()
     while True:
-      pos = positions[0] if args.loop else positions[pos_idx]
+      if args.loop:
+        pos = positions[0]
+      elif args.forever:
+        pos = cols - pos_idx
+      else:
+        pos = positions[pos_idx]
       mesh = build_articulated_roach(
           anim_step, args.dance, with_sombrero=args.sombrero
       )
@@ -547,7 +616,8 @@ def run():
                   f"\033[{base_r + r};{trail_col}H\033[38;2;70;70;85m{dots}"
               )
 
-      for s in range(swarm_count):
+      count = None if args.forever else swarm_count
+      for s in visible_roaches(pos, spacing, box_w, cols, count):
         roach_x = pos + s * spacing
         if roach_x >= cols or roach_x <= -box_w:
           continue
@@ -621,11 +691,17 @@ def run():
       anim_step += dance_step_rate * 0.1
       hop_phase += hop_rate
       frame_idx += 1
-      time.sleep(delay)
+      # Sleep only for what is left of this frame's time slot.
+      next_frame += delay
+      wait = next_frame - time.monotonic()
+      if wait > 0:
+        time.sleep(wait)
+      else:
+        next_frame = time.monotonic()  # running behind: don't try to catch up
 
       if not args.loop:
         pos_idx += 1
-        if pos_idx >= len(positions):
+        if not args.forever and pos_idx >= len(positions):
           break
 
   except KeyboardInterrupt:
